@@ -18,6 +18,24 @@ void SemanticAnalyser::visit(Integer &integer)
   integer.type = SizedType(Type::integer, 8);
 }
 
+void SemanticAnalyser::visit(PositionalParameter &param)
+{
+  param.type = SizedType(Type::integer, 8);
+  std::string pstr = bpftrace_.get_param(param.n);
+  if (is_final_pass()) {
+    if (!bpftrace_.is_numeric(pstr)) {
+      if (!call_ || call_->func != "str")
+        /*
+         * call_ was added just for this test: ensuring a string parameter is
+         * only used inside str(). Without it, string parameters used as
+         * integers would return their buffer address. Maybe that's ok?
+         * If this behavior is changed, codegen needs to support it.
+         */
+        err_ << "$" << param.n << " used numerically, but given \"" << pstr << "\". Try using str($" << param.n << ")." << std::endl;
+    }
+  }
+}
+
 void SemanticAnalyser::visit(String &string)
 {
   if (string.str.size() > STRING_SIZE-1) {
@@ -109,6 +127,9 @@ void SemanticAnalyser::visit(Builtin &builtin)
 
 void SemanticAnalyser::visit(Call &call)
 {
+  // needed for positional parameters context:
+  call_ = &call;
+
   if (call.vargs) {
     for (Expression *expr : *call.vargs) {
       expr->accept(*this);
@@ -202,16 +223,35 @@ void SemanticAnalyser::visit(Call &call)
 
     call.type = SizedType(Type::none, 0);
   }
-  else if (call.func == "str" || call.func == "sym" || call.func == "usym") {
+  else if (call.func == "str") {
+    if (check_varargs(call, 1, 2)) {
+      check_arg(call, Type::integer, 0);
+      call.type = SizedType(Type::string, bpftrace_.strlen_);
+      if (is_final_pass()) {
+        if (call.vargs->size() > 1) {
+          check_arg(call, Type::integer, 1, false);
+        }
+      }
+    }
+  }
+  else if (call.func == "sym" || call.func == "usym") {
     check_nargs(call, 1);
     check_arg(call, Type::integer, 0);
 
-    if (call.func == "str")
-      call.type = SizedType(Type::string, STRING_SIZE);
-    else if (call.func == "sym")
+    if (call.func == "sym")
       call.type = SizedType(Type::sym, 8);
     else if (call.func == "usym")
       call.type = SizedType(Type::usym, 16);
+  }
+  else if (call.func == "ntop") {
+    check_nargs(call, 2);
+    check_arg(call, Type::integer, 0);
+    check_arg(call, Type::integer, 1);
+    // 3 x 64 bit words are needed, hence 24 bytes
+    //  0 - To store address family, but stay word-aligned
+    //  1 - To store ipv4 or first half of ipv6
+    //  2 - Reserved for future use, to store remainder of ipv6
+    call.type = SizedType(Type::inet, 24);
   }
   else if (call.func == "join") {
     check_assignment(call, false, false);

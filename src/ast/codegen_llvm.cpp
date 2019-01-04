@@ -20,6 +20,20 @@ void CodegenLLVM::visit(Integer &integer)
   expr_ = b_.getInt64(integer.n);
 }
 
+void CodegenLLVM::visit(PositionalParameter &param)
+{
+  std::string pstr = bpftrace_.get_param(param.n);
+  if (bpftrace_.is_numeric(pstr)) {
+    expr_ = b_.getInt64(std::stoll(pstr));
+  } else {
+    Constant *const_str = ConstantDataArray::getString(module_->getContext(), pstr, true);
+    AllocaInst *buf = b_.CreateAllocaBPF(ArrayType::get(b_.getInt8Ty(), pstr.length() + 1), "str");
+    b_.CreateMemSet(buf, b_.getInt8(0), pstr.length() + 1, 1);
+    b_.CreateStore(b_.CreateGEP(const_str, b_.getInt64(0)), buf);
+    expr_ = buf;
+  }
+}
+
 void CodegenLLVM::visit(String &string)
 {
   string.str.resize(string.type.size-1);
@@ -329,11 +343,32 @@ void CodegenLLVM::visit(Call &call)
   }
   else if (call.func == "str")
   {
-    AllocaInst *buf = b_.CreateAllocaBPF(call.type, "str");
-    b_.CreateMemSet(buf, b_.getInt8(0), call.type.size, 1);
+    AllocaInst *strlen = b_.CreateAllocaBPF(b_.getInt64Ty(), "strlen");
+    b_.CreateMemSet(strlen, b_.getInt8(0), sizeof(uint64_t), 1);
+    if (call.vargs->size() > 1) {
+      call.vargs->at(1)->accept(*this);
+      Value *proposed_strlen = b_.CreateAdd(expr_, b_.getInt64(1)); // add 1 to accommodate probe_read_str's null byte
+
+      // largest read we'll allow = our global string buffer size
+      Value *max = b_.getInt64(bpftrace_.strlen_);
+      // integer comparison: unsigned less-than-or-equal-to
+      CmpInst::Predicate P = CmpInst::ICMP_ULE;
+      // check whether proposed_strlen is less-than-or-equal-to maximum
+      Value *Cmp = b_.CreateICmp(P, proposed_strlen, max, "str.min.cmp");
+      // select proposed_strlen if it's sufficiently low, otherwise choose maximum
+      Value *Select = b_.CreateSelect(Cmp, proposed_strlen, max, "str.min.select");
+      b_.CreateStore(Select, strlen);
+    } else {
+      b_.CreateStore(b_.getInt64(bpftrace_.strlen_), strlen);
+    }
+    AllocaInst *buf = b_.CreateAllocaBPF(bpftrace_.strlen_, "str");
+    b_.CreateMemSet(buf, b_.getInt8(0), bpftrace_.strlen_, 1);
     call.vargs->front()->accept(*this);
-    b_.CreateProbeReadStr(buf, call.type.size, expr_);
+    b_.CreateProbeReadStr(buf, b_.CreateLoad(strlen), expr_);
+    b_.CreateLifetimeEnd(strlen);
+
     expr_ = buf;
+    expr_deleter_ = [this,buf]() { b_.CreateLifetimeEnd(buf); };
   }
   else if (call.func == "kaddr")
   {
@@ -408,6 +443,20 @@ void CodegenLLVM::visit(Call &call)
     b_.CreateStore(pid, pid_offset);
     expr_ = buf;
   }
+  else if (call.func == "ntop")
+  {
+    // store uint64_t[2] with: [0]: (uint64_t)address_family, [1]: (uint64_t) inet_address
+    // To support ipv6, [2] should be the remaining bytes of the address
+    AllocaInst *buf = b_.CreateAllocaBPF(call.type, "inet");
+    b_.CreateMemSet(buf, b_.getInt8(0), call.type.size, 1);
+    Value *af_offset = b_.CreateGEP(buf, b_.getInt64(0));
+    Value *inet_offset = b_.CreateGEP(buf, {b_.getInt64(0), b_.getInt64(8)});
+    call.vargs->at(0)->accept(*this);
+    b_.CreateStore(expr_, af_offset);
+    call.vargs->at(1)->accept(*this);
+    b_.CreateStore(expr_, inet_offset);
+    expr_ = buf;
+  }
   else if (call.func == "reg")
   {
     auto &reg_name = static_cast<String&>(*call.vargs->at(0)).str;
@@ -456,12 +505,16 @@ void CodegenLLVM::visit(Call &call)
     for (int i=1; i<call.vargs->size(); i++)
     {
       Expression &arg = *call.vargs->at(i);
+      expr_deleter_ = nullptr;
       arg.accept(*this);
       Value *offset = b_.CreateGEP(printf_args, {b_.getInt32(0), b_.getInt32(i)});
       if (arg.type.IsArray())
         b_.CREATE_MEMCPY(offset, expr_, arg.type.size, 1);
       else
         b_.CreateStore(expr_, offset);
+
+      if (expr_deleter_)
+        expr_deleter_();
     }
 
     printf_id_++;
@@ -505,12 +558,16 @@ void CodegenLLVM::visit(Call &call)
     for (int i=1; i<call.vargs->size(); i++)
     {
       Expression &arg = *call.vargs->at(i);
+      expr_deleter_ = nullptr;
       arg.accept(*this);
       Value *offset = b_.CreateGEP(system_args, {b_.getInt32(0), b_.getInt32(i)});
       if (arg.type.IsArray())
         b_.CREATE_MEMCPY(offset, expr_, arg.type.size, 1);
       else
         b_.CreateStore(expr_, offset);
+
+      if (expr_deleter_)
+        expr_deleter_();
     }
 
     system_id_++;
@@ -1100,22 +1157,32 @@ void CodegenLLVM::visit(Probe &probe)
 
     for (auto &attach_point : *probe.attach_points) {
       current_attach_point_ = attach_point;
-      std::string file_name;
+      std::set<std::string> matches;
       switch (probetype(attach_point->provider))
       {
         case ProbeType::kprobe:
         case ProbeType::kretprobe:
-          file_name = "/sys/kernel/debug/tracing/available_filter_functions";
+          matches = bpftrace_.find_wildcard_matches(attach_point->target,
+                                                    attach_point->func,
+                                                    "/sys/kernel/debug/tracing/available_filter_functions");
           break;
+        case ProbeType::uprobe:
+        case ProbeType::uretprobe:
+        {
+            auto symbol_stream = std::istringstream(bpftrace_.extract_func_symbols_from_path(attach_point->target));
+            matches = bpftrace_.find_wildcard_matches("", attach_point->func, symbol_stream);
+            break;
+        }
         case ProbeType::tracepoint:
-          file_name = "/sys/kernel/debug/tracing/available_events";
+          matches = bpftrace_.find_wildcard_matches(attach_point->target,
+                                                    attach_point->func,
+                                                    "/sys/kernel/debug/tracing/available_events");
           break;
         default:
           std::cerr << "Wildcard matches aren't available on probe type '"
                     << attach_point->provider << "'" << std::endl;
           return;
       }
-      auto matches = bpftrace_.find_wildcard_matches(attach_point->target, attach_point->func, file_name);
       for (auto &match : matches) {
         printf_id_ = starting_printf_id_;
         time_id_ = starting_time_id_;
@@ -1176,7 +1243,8 @@ AllocaInst *CodegenLLVM::getMapKey(Map &map)
     for (Expression *expr : *map.vargs) {
       expr->accept(*this);
       Value *offset_val = b_.CreateGEP(key, {b_.getInt64(0), b_.getInt64(offset)});
-      if (expr->type.type == Type::string || expr->type.type == Type::usym)
+      if (expr->type.type == Type::string || expr->type.type == Type::usym ||
+        expr->type.type == Type::inet)
         b_.CREATE_MEMCPY(offset_val, expr_, expr->type.size, 1);
       else
         b_.CreateStore(expr_, offset_val);
@@ -1206,7 +1274,8 @@ AllocaInst *CodegenLLVM::getHistMapKey(Map &map, Value *log2)
     for (Expression *expr : *map.vargs) {
       expr->accept(*this);
       Value *offset_val = b_.CreateGEP(key, {b_.getInt64(0), b_.getInt64(offset)});
-      if (expr->type.type == Type::string || expr->type.type == Type::usym)
+      if (expr->type.type == Type::string || expr->type.type == Type::usym ||
+        expr->type.type == Type::inet)
         b_.CREATE_MEMCPY(offset_val, expr_, expr->type.size, 1);
       else
         b_.CreateStore(expr_, offset_val);

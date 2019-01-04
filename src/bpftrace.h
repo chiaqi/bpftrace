@@ -50,7 +50,7 @@ class BPFtrace
 {
 public:
   BPFtrace() : ncpus_(ebpf::get_possible_cpus().size()) { }
-  virtual ~BPFtrace() { }
+  virtual ~BPFtrace();
   virtual int add_probe(ast::Probe &p);
   int num_probes() const;
   int run(std::unique_ptr<BpfOrc> bpforc);
@@ -61,13 +61,19 @@ public:
   std::string get_stack(uint64_t stackidpid, bool ustack, int indent=0);
   std::string resolve_sym(uintptr_t addr, bool show_offset=false);
   std::string resolve_usym(uintptr_t addr, int pid, bool show_offset=false);
+  std::string resolve_inet(int af, uint64_t inet);
   std::string resolve_uid(uintptr_t addr);
   uint64_t resolve_kname(const std::string &name);
   uint64_t resolve_uname(const std::string &name, const std::string &path);
+  std::string extract_func_symbols_from_path(const std::string &path);
   std::string resolve_probe(uint64_t probe_id);
   uint64_t resolve_cgroupid(const std::string &path);
   std::vector<uint64_t> get_arg_values(std::vector<Field> args, uint8_t* arg_data);
-  int pid_;
+  void add_param(const std::string &param);
+  bool is_numeric(std::string str);
+  std::string get_param(int index);
+  std::string cmd_;
+  int pid_{0};
 
   std::map<std::string, std::unique_ptr<IMap>> maps_;
   std::map<std::string, Struct> structs_;
@@ -81,8 +87,11 @@ public:
   int join_argnum_;
   int join_argsize_;
 
+  uint64_t strlen_ = 64;
+
   static void sort_by_key(std::vector<SizedType> key_args,
       std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> &values_by_key);
+  virtual std::set<std::string> find_wildcard_matches(const std::string &prefix, const std::string &func, std::istream &symbol_name_stream);
   virtual std::set<std::string> find_wildcard_matches(const std::string &prefix, const std::string &attach_point, const std::string &file_name);
 
 protected:
@@ -96,10 +105,12 @@ private:
   std::map<int, void *> pid_sym_;
   int ncpus_;
   int online_cpus_;
+  std::vector<int> child_pids_;
+  std::vector<std::string> params_;
 
   std::unique_ptr<AttachedProbe> attach_probe(Probe &probe, const BpfOrc &bpforc);
   int setup_perf_events();
-  void poll_perf_events(int epollfd, int timeout=-1);
+  void poll_perf_events(int epollfd, bool drain=false);
   int clear_map(IMap &map);
   int zero_map(IMap &map);
   int print_map(IMap &map, uint32_t top, uint32_t div);
@@ -109,7 +120,7 @@ private:
   int print_hist(const std::vector<uint64_t> &values, uint32_t div) const;
   int print_lhist(const std::vector<uint64_t> &values, int min, int max, int step) const;
   static uint64_t reduce_value(const std::vector<uint8_t> &value, int ncpus);
-  static uint64_t min_value(const std::vector<uint8_t> &value, int ncpus);
+  static int64_t min_value(const std::vector<uint8_t> &value, int ncpus);
   static uint64_t max_value(const std::vector<uint8_t> &value, int ncpus);
   static uint64_t read_address_from_output(std::string output);
   static std::string exec_system(const char* cmd);
@@ -117,6 +128,9 @@ private:
   static std::string lhist_index_label(int number);
   static std::vector<std::string> split_string(std::string &str, char split_by);
   std::vector<uint8_t> find_empty_key(IMap &map, size_t size) const;
+  static std::string resolve_binary_path(const std::string& cmd);
+  static int spawn_child(const std::vector<std::string>& args);
+  static bool is_pid_alive(int pid);
 };
 
 } // namespace bpftrace

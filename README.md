@@ -159,6 +159,10 @@ bpftrace contains various tools, which also serve as examples of programming in 
 - tools/[statsnoop.bt](tools/statsnoop.bt): Trace stat() syscalls for general debugging. [Examples](tools/statsnoop_example.txt).
 - tools/[syncsnoop.bt](tools/syncsnoop.bt): Trace sync() variety of syscalls. [Examples](tools/syncsnoop_example.txt).
 - tools/[syscount.bt](tools/syscount.bt): Count system calls. [Examples](tools/syscount_example.txt).
+- tools/[tcpaccept](tools/tcpaccept.bt): Trace TCP passive connections (accept()). [Examples](tools/tcpaccept_example.txt).
+- tools/[tcpconnect](tools/tcpconnect.bt): Trace TCP active connections (connect()). [Examples](tools/tcpconnect_example.txt).
+- tools/[tcpdrop](tools/tcpdrop.bt): Trace kernel-based TCP packet drops with details. [Examples](tools/tcpdrop_example.txt).
+- tools/[tcpretrans](tools/tcpretrans.bt): Trace TCP retransmits. [Examples](tools/tcpretrans_example.txt).
 - tools/[vfscount.bt](tools/vfscount.bt): Count VFS calls. [Examples](tools/vfscount_example.txt).
 - tools/[vfsstat.bt](tools/vfsstat.bt): Count some VFS calls, with per-second summaries. [Examples](tools/vfsstat_example.txt).
 - tools/[writeback.bt](tools/writeback.bt): Trace file system writeback events with details. [Examples](tools/writeback_example.txt).
@@ -224,6 +228,8 @@ A single probe can be attached to multiple events:
 ### Wildcards
 Some probe types allow wildcards to be used when attaching a probe:
 
+`uprobe:/bin/bash:read* { ... }`
+
 `kprobe:vfs_* { ... }`
 
 ### Predicates
@@ -249,8 +255,9 @@ Variables:
 - `retval` - Return value from function being traced
 - `func` - Name of the function currently being traced
 - `probe` - Full name of the probe
-- `curtask` - Current task_struct as a u64.
-- `rand` - Random number of type u32.
+- `curtask` - Current task_struct as a u64
+- `rand` - Random number of type u32
+- `$1`, `$2`, ... etc. - Positional parameters to the bpftrace program
 
 Functions:
 - `hist(int n)` - Produce a log2 histogram of values of `n`
@@ -262,12 +269,13 @@ Functions:
 - `avg(int n)` - Average this value
 - `stats(int n)` - Return the count, average, and total for this value
 - `delete(@x)` - Delete the map element passed in as an argument
-- `str(char *s)` - Returns the string pointed to by `s`
+- `str(char *s [, int length])` - Returns the string pointed to by `s`
 - `printf(char *fmt, ...)` - Print formatted to stdout
 - `print(@x[, int top [, int div]])` - Print a map, with optional top entry count and divisor
 - `clear(@x)` - Delete all key/values from a map
 - `sym(void *p)` - Resolve kernel address
 - `usym(void *p)` - Resolve user space address
+- `ntop(int af, int addr)` - Resolve ip address
 - `kaddr(char *name)` - Resolve kernel symbol name
 - `uaddr(char *name)` - Resolve user space symbol name
 - `reg(char *name)` - Returns the value stored in the named register
